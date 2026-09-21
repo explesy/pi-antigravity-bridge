@@ -5,8 +5,11 @@
 // Run: npm test
 
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import fs from "node:fs";
 import { symlinkSync } from "node:fs";
+import { createServer, type ServerResponse } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { test } from "vitest";
@@ -29,6 +32,38 @@ const opts = {
 	scriptPath: "/data/dir/approval-hook.mjs",
 	parkBudgetMs: 480_000,
 };
+
+async function runHookScript(
+	respond: (_request: unknown, response: ServerResponse) => void,
+): Promise<Record<string, unknown>> {
+	const server = createServer(respond);
+	server.listen(0, "127.0.0.1");
+	await once(server, "listening");
+	const address = server.address();
+	assert.ok(address && typeof address !== "string");
+	const workspace = tmpWs();
+	const scriptPath = path.join(workspace, "approval-hook.mjs");
+	fs.writeFileSync(
+		scriptPath,
+		hookScriptSource({ port: address.port, token: "test-token", deadlineMs: 1_000 }),
+	);
+
+	try {
+		const child = spawn(process.execPath, [scriptPath], { stdio: ["pipe", "pipe", "pipe"] });
+		child.stdin.end(JSON.stringify({ toolCall: { name: "run_command", args: {} } }));
+		let stdout = "";
+		let stderr = "";
+		child.stdout.on("data", (chunk) => { stdout += String(chunk); });
+		child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+		const [code] = await once(child, "close") as [number | null];
+		assert.equal(code, 0);
+		assert.equal(stderr, "");
+		return JSON.parse(stdout) as Record<string, unknown>;
+	} finally {
+		await new Promise<void>((resolve) => server.close(() => resolve()));
+		fs.rmSync(workspace, { recursive: true, force: true });
+	}
+}
 
 test("stages into a fresh workspace: group shape, matcher, generous timeout", () => {
 	const ws = tmpWs();
@@ -195,8 +230,32 @@ test("hook script source: posts, polls, fails closed on deadline", () => {
 	assert.match(src, /\/approval/);
 	assert.match(src, /x-bridge-token/);
 	assert.equal(src.includes("secret-token"), true);
+	// Preserve the complete terminal payload. Antigravity needs the reason as
+	// well as the decision; returning only json.decision is malformed.
+	assert.match(src, /console\.log\(JSON\.stringify\(json\)\)/);
+	assert.match(src, /json && typeof json === "object" && "decision" in json/);
 	assert.match(src, /decision: "deny", reason: "approval gate deadline exceeded"/);
 	assert.match(src, /decision: "deny", reason: "approval gate unreachable/);
+});
+
+test("hook script preserves direct terminal approval payload", async () => {
+	const result = await runHookScript((_request, response) => {
+		response.setHeader("content-type", "application/json");
+		response.end(JSON.stringify({ decision: "deny", reason: "no active antigravity turn" }));
+	});
+	assert.deepEqual(result, { decision: "deny", reason: "no active antigravity turn" });
+});
+
+test("hook script preserves polled terminal approval payload", async () => {
+	const result = await runHookScript((request, response) => {
+		response.setHeader("content-type", "application/json");
+		response.end(
+			request && typeof request === "object" && "url" in request && request.url === "/approval"
+				? JSON.stringify({ ticket: "ticket-1" })
+				: JSON.stringify({ decision: "deny", reason: "no active antigravity turn" }),
+		);
+	});
+	assert.deepEqual(result, { decision: "deny", reason: "no active antigravity turn" });
 });
 
 test("stagedTimeoutSeconds floors at 60s and adds margin", () => {

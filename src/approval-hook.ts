@@ -98,7 +98,10 @@ try {
 	const json = await res.json();
 	// Ungated payloads get a terminal decision right on the POST (no park).
 	if (json && typeof json === "object" && "decision" in json) {
-		console.log(JSON.stringify(json.decision));
+		// Antigravity expects the complete approval payload. Returning only the
+		// scalar decision drops the reason and makes the hook response invalid for
+		// clients that validate the { decision, reason } shape.
+		console.log(JSON.stringify(json));
 		process.exit(0);
 	}
 	ticket = json.ticket ?? "";
@@ -115,7 +118,13 @@ while (Date.now() < DEADLINE) {
 		});
 		const json = await res.json();
 		if (json.status !== "pending") {
-			console.log(JSON.stringify(json.decision ?? { decision: "deny", reason: "gate returned no decision" }));
+			console.log(
+				JSON.stringify(
+					json && typeof json === "object" && "decision" in json
+						? json
+						: { decision: "deny", reason: "gate returned no decision" },
+				),
+			);
 			process.exit(0);
 		}
 	} catch {}
